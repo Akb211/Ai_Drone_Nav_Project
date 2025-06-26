@@ -83,61 +83,54 @@ class DQNAgent:
             5: {"command": "down", "value": 20},       # Move down 20cm
         }
     
+    # ISSUE: Inconsistent state vector size
+# FIX: Proper state validation
+
     def get_state_from_environment(self, human_boxes, slam_data, drone_telemetry):
-        # Initialize state vector
         state = []
         
-        # 1. Drone position and orientation (normalized)
+        # 1. Drone position and orientation (6 values)
         if slam_data and "position" in slam_data:
-            # Normalize position to [-1, 1] range based on map size
-            map_size = 1000  # Assuming 10m x 10m map (1000cm)
-            norm_pos = np.array(slam_data["position"]) / (map_size / 2)
+            map_size = 1000
+            norm_pos = np.clip(np.array(slam_data["position"]) / (map_size / 2), -1, 1)
             state.extend(list(norm_pos))
             
-            # Normalize orientation to [-1, 1]
-            norm_orientation = np.array(slam_data["orientation"]) / 180.0
+            norm_orientation = np.clip(np.array(slam_data["orientation"]) / 180.0, -1, 1)
             state.extend(list(norm_orientation))
         else:
-            # If no SLAM data, use zeros
-            state.extend([0, 0, 0, 0, 0, 0])
+            state.extend([0.0] * 6)
         
-        # 2. Human detection features
+        # 2. Human detection features (5 values)
         if human_boxes and len(human_boxes) > 0:
-            # Get closest human (assume the largest bounding box is closest)
             largest_box = max(human_boxes, key=lambda box: box[2] * box[3])
             x, y, w, h = largest_box
             
-            # Normalize box coordinates to [-1, 1]
-            frame_width, frame_height = 320, 240  # From your main function
-            norm_x = (x + w/2) / frame_width * 2 - 1  # Center X
-            norm_y = (y + h/2) / frame_height * 2 - 1  # Center Y
-            norm_size = (w * h) / (frame_width * frame_height)  # Relative size
+            frame_width, frame_height = 640, 480  # Use actual frame dimensions
+            norm_x = np.clip((x + w/2) / frame_width * 2 - 1, -1, 1)
+            norm_y = np.clip((y + h/2) / frame_height * 2 - 1, -1, 1)
+            norm_size = np.clip((w * h) / (frame_width * frame_height), 0, 1)
+            distance_estimate = np.clip(1.0 - norm_size, 0, 1)
             
-            # Distance estimate (inverse of size)
-            distance_estimate = 1.0 - norm_size
-            
-            state.extend([norm_x, norm_y, norm_size, distance_estimate])
-            state.append(1.0)  # Human detected flag
+            state.extend([norm_x, norm_y, norm_size, distance_estimate, 1.0])
         else:
-            # No humans detected
-            state.extend([0, 0, 0, 1.0, 0.0])
+            state.extend([0.0] * 5)
         
-        # 3. Obstacle proximity in each direction (from SLAM)
+        # 3. Safe directions (6 values)
         if slam_data and "safe_directions" in slam_data:
-            # Convert safe directions to binary features
             directions = ["forward", "backward", "left", "right", "up", "down"]
             for direction in directions:
                 state.append(1.0 if direction in slam_data["safe_directions"] else 0.0)
         else:
-            # If no SLAM data, assume all directions are safe
-            state.extend([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+            state.extend([1.0] * 6)
         
-        # 4. Battery level (normalized to [0, 1])
+        # 4. Battery level (1 value)
         if drone_telemetry and "battery" in drone_telemetry:
-            state.append(drone_telemetry["battery"] / 100.0)
+            state.append(np.clip(drone_telemetry["battery"] / 100.0, 0, 1))
         else:
-            state.append(1.0)  # Assume full battery if no data
+            state.append(1.0)
         
+        # Ensure exactly 18 values
+        assert len(state) == 18, f"State vector must be exactly 18 values, got {len(state)}"
         return np.array(state, dtype=np.float32)
     
     def select_action(self, state):
@@ -443,6 +436,48 @@ class DroneRLSystem:
         processed_frame = self._draw_rl_info(slam_frame, action, self.current_episode_reward)
         
         return processed_frame, action
+    
+    def get_enhanced_reward(self, state, action, next_state, human_detected, 
+                        collision_occurred, battery_level, mission_complete, exploration_bonus=0.0):
+        reward = 0.0
+        
+        # Collision penalty (terminal)
+        if collision_occurred:
+            return -100.0
+        
+        # Human detection reward with distance consideration
+        if human_detected:
+            human_x, human_y = next_state[6], next_state[7]
+            center_distance = np.sqrt(human_x**2 + human_y**2)
+            
+            # Reward for centering human in frame
+            centering_reward = 10.0 * (1.0 - min(center_distance, 1.0))
+            
+            # Additional reward for maintaining detection
+            stability_reward = 5.0 if self.consecutive_detections > 3 else 0.0
+            
+            reward += centering_reward + stability_reward
+        
+        # Exploration bonus for visiting new areas
+        reward += exploration_bonus * 2.0
+        
+        # Smooth movement reward (penalize erratic movements)
+        if hasattr(self, 'last_action') and self.last_action is not None:
+            if action == self.last_action:
+                reward += 0.5  # Reward for smooth movement
+        
+        # Battery efficiency
+        battery_penalty = -0.1 * (1.0 - battery_level/100.0)
+        reward += battery_penalty
+        
+        # Mission completion
+        if mission_complete:
+            reward += 100.0
+        
+        # Time penalty
+        reward -= 0.1
+        
+        return reward
     
     def _draw_rl_info(self, frame, action, episode_reward):
         # Clone frame for drawing

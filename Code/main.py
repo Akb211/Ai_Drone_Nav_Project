@@ -9,6 +9,8 @@ from tello_yolo_detection import HumanDetector, HumanTracker
 from collision import SLAMSystem
 from rl import DroneRLSystem
 import matplotlib.pyplot as plt               
+import threading
+from queue import Queue
 
 def return_to_home(tello, slam_system, frame_width, frame_height):
     print("Returning to home position...")
@@ -205,7 +207,27 @@ def setup_drone():
 def setup_video_recorder(output_path, width=640, height=480, fps=30):
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     return cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+def robust_drone_control(func):
+    """Decorator for robust drone command execution"""
+    def wrapper(*args, **kwargs):
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                print(f"Command failed (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    print("All attempts failed, initiating emergency protocol")
+                    return False
+                time.sleep(0.5)
+        return False
+    return wrapper
 
+# Apply to drone movements
+@robust_drone_control
+def safe_move_forward(drone, distance):
+    drone.move_forward(distance)
+    return True
 def run_simulation_mode(detector, slam, rl_system):
     # Load a test video file or use webcam
     cap = cv2.VideoCapture(0)  # Use webcam as fallback
@@ -267,7 +289,58 @@ def run_simulation_mode(detector, slam, rl_system):
     finally:
         cap.release()
         cv2.destroyAllWindows()
+class ThreadedDroneSystem:
+    def __init__(self, detector, slam, rl_system):
+        self.detector = detector
+        self.slam = slam
+        self.rl_system = rl_system
+        self.frame_queue = Queue(maxsize=5)
+        self.result_queue = Queue(maxsize=5)
+        
+    def detection_worker(self):
+        """Run detection in separate thread"""
+        while True:
+            if not self.frame_queue.empty():
+                frame = self.frame_queue.get()
+                results = self.detector.detect(frame)
+                self.result_queue.put(results)
+                
+    def start_threaded_processing(self):
+        detection_thread = threading.Thread(target=self.detection_worker, daemon=True)
+        detection_thread.start()
 
+class EmergencyProtocol:
+    def __init__(self, drone, slam):
+        self.drone = drone
+        self.slam = slam
+        self.emergency_triggered = False
+        
+    def check_emergency_conditions(self, telemetry):
+        """Check for emergency conditions"""
+        conditions = {
+            'low_battery': telemetry.get('battery', 100) < 15,
+            'connection_lost': not self.drone.is_connected,
+            'extreme_altitude': abs(telemetry.get('height', 0)) > 300,
+            'no_safe_directions': len(self.slam.safe_directions) == 0
+        }
+        
+        return any(conditions.values()), conditions
+    
+    def execute_emergency_landing(self):
+        """Safe emergency landing procedure"""
+        if not self.emergency_triggered:
+            self.emergency_triggered = True
+            print("EMERGENCY PROTOCOL ACTIVATED")
+            
+            try:
+                # Try controlled landing first
+                self.drone.land()
+            except:
+                try:
+                    # Emergency motor stop as last resort
+                    self.drone.emergency()
+                except:
+                    print("CRITICAL: Unable to execute emergency procedures")
 def main():
     args = parse_args()
     
@@ -435,7 +508,7 @@ def main():
                 # Run inference mode (single mission)
                 print("Running in inference mode...")
                 frame_count = 0
-                
+
                 while True:
                     # Get frame from the Tello drone
                     frame = tello.get_frame_read().frame

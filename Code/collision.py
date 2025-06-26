@@ -104,58 +104,70 @@ class SLAMSystem:
         
         return processed_frame, self.safe_directions
     
+
+    def correct_drift_with_imu(self, imu_data):
+        """Use IMU data to correct SLAM drift"""
+        if imu_data and len(self.pose_history) > 10:
+            # Simple drift correction using IMU
+            imu_orientation = np.array([imu_data.get('roll', 0), 
+                                    imu_data.get('pitch', 0), 
+                                    imu_data.get('yaw', 0)])
+            
+            # Weighted average with SLAM orientation
+            alpha = 0.7  # Trust SLAM more than IMU
+            self.orientation = alpha * self.orientation + (1 - alpha) * imu_orientation
     def _update_position_from_features(self, kp, des):
-        if len(kp) < 10 or des is None or self.prev_des is None:
-            return
+            if len(kp) < 10 or des is None or self.prev_des is None:
+                return
             
-        # Match features
-        matches = self.bf_matcher.match(self.prev_des, des)
-        
-        # Sort matches by distance
-        matches = sorted(matches, key=lambda x: x.distance)
-        
-        # Take only good matches
-        good_matches = matches[:int(len(matches) * 0.7)]
-        
-        if len(good_matches) < 8:
-            return
+            # Match features
+            matches = self.bf_matcher.match(self.prev_des, des)
             
-        # Extract matched keypoints
-        prev_pts = np.float32([self.prev_kp[m.queryIdx].pt for m in good_matches])
-        curr_pts = np.float32([kp[m.trainIdx].pt for m in good_matches])
-        
-        # Calculate essential matrix
-        # Use the dimensions of the previous frame that we stored
-        h, w = self.prev_frame.shape
-        E, mask = cv2.findEssentialMat(prev_pts, curr_pts, 
-                                       focal=500, # Approximate focal length
-                                       pp=(w//2, h//2), 
-                                       method=cv2.RANSAC, 
-                                       prob=0.999, 
-                                       threshold=1.0)
-        
-        if E is None:
-            return
+            # Sort matches by distance
+            matches = sorted(matches, key=lambda x: x.distance)
             
-        # Recover relative pose
-        _, R, t, _ = cv2.recoverPose(E, prev_pts, curr_pts, 
-                                     focal=500, 
-                                     pp=(w//2, h//2))
-        
-        # Scale translation (in a real system, this would come from depth or other sensors)
-        scale = 10.0  # Arbitrary scale factor, to be replaced with actual scale estimation
-        
-        # Update position (simplified - in a real implementation, this would use proper pose composition)
-        translation = scale * t.flatten()
-        
-        # Convert rotation matrix to Euler angles
-        r = Rotation.from_matrix(R)
-        euler = r.as_euler('xyz', degrees=True)
-        
-        # Update position and orientation
-        # Note: This is simplified - a real system would use proper pose composition
-        self.position += translation
-        self.orientation += euler
+            # Take only good matches
+            good_matches = matches[:int(len(matches) * 0.7)]
+            
+            if len(good_matches) < 8:
+                return
+                
+            # Extract matched keypoints
+            prev_pts = np.float32([self.prev_kp[m.queryIdx].pt for m in good_matches])
+            curr_pts = np.float32([kp[m.trainIdx].pt for m in good_matches])
+            
+            # Calculate essential matrix
+            # Use the dimensions of the previous frame that we stored
+            h, w = self.prev_frame.shape
+            E, mask = cv2.findEssentialMat(prev_pts, curr_pts, 
+                                        focal=500, # Approximate focal length
+                                        pp=(w//2, h//2), 
+                                        method=cv2.RANSAC, 
+                                        prob=0.999, 
+                                        threshold=1.0)
+            
+            if E is None:
+                return
+                
+            # Recover relative pose
+            _, R, t, _ = cv2.recoverPose(E, prev_pts, curr_pts, 
+                                        focal=500, 
+                                        pp=(w//2, h//2))
+            
+            # Scale translation (in a real system, this would come from depth or other sensors)
+            scale = 10.0  # Arbitrary scale factor, to be replaced with actual scale estimation
+            
+            # Update position (simplified - in a real implementation, this would use proper pose composition)
+            translation = scale * t.flatten()
+            
+            # Convert rotation matrix to Euler angles
+            r = Rotation.from_matrix(R)
+            euler = r.as_euler('xyz', degrees=True)
+            
+            # Update position and orientation
+            # Note: This is simplified - a real system would use proper pose composition
+            self.position += translation
+            self.orientation += euler
     
     def _update_position_from_sensors(self, drone):
         # Get sensor data from the Tello drone
@@ -207,21 +219,22 @@ class SLAMSystem:
                 new_points.append([x_world, y_world, z_world])
         
         if len(new_points) > 0:
-            # Create point cloud
             new_cloud = o3d.geometry.PointCloud()
             new_cloud.points = o3d.utility.Vector3dVector(np.array(new_points))
             
-            # Transform to world coordinates using current pose
+            # Transform to world coordinates
             R = Rotation.from_euler('xyz', self.orientation, degrees=True).as_matrix()
             T = np.eye(4)
             T[:3, :3] = R
             T[:3, 3] = self.position
             new_cloud.transform(T)
             
-            # Add to global point cloud
+            # MEMORY MANAGEMENT: Limit point cloud size
             self.point_cloud += new_cloud
+            if len(self.point_cloud.points) > 50000:  # Limit to 50k points
+                # Downsample using voxel grid
+                self.point_cloud = self.point_cloud.voxel_down_sample(voxel_size=5.0)
             
-            # Update occupancy grid
             self._update_occupancy_grid(new_cloud)
     
     def _estimate_depth_from_motion(self, gray_frame, keypoints):

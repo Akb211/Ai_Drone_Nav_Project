@@ -4,6 +4,8 @@ import numpy as np
 import time
 from ultralytics import YOLO
 from djitellopy import Tello
+import torch
+
 
 class HumanDetector:
     def __init__(self, model_path, device="cuda:0"):
@@ -18,7 +20,8 @@ class HumanDetector:
             print(f"Error loading YOLOv11 model: {e}")
             exit(1)
         self.names = self.model.names  # Class names
-
+        self.frame_skip_count = 0
+        self.max_frame_skip = 3 
     def detect(self, frame, conf_threshold=0.5):
         results = self.model(frame, verbose=False)[0]  # Perform detection
         boxes = []
@@ -31,7 +34,17 @@ class HumanDetector:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 boxes.append([x1, y1, x2 - x1, y2 - y1])
         return boxes
-
+class OptimizedHumanDetector(HumanDetector):
+    def __init__(self, model_path, device="cuda:0"):
+        super().__init__(model_path, device)
+        # Enable memory optimization
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.backends.cudnn.benchmark = True
+            
+    def detect(self, frame, conf_threshold=0.5):
+        with torch.cuda.amp.autocast():  # Mixed precision for speed
+            return super().detect(frame, conf_threshold)
 class HumanTracker:
     def __init__(self):
         self.trackers = []  # List to store trackers
@@ -57,6 +70,21 @@ class HumanTracker:
                 new_trackers.append((tracker, box))
         self.trackers = new_trackers
         return updated_boxes
+    def detect_with_optimization(self, frame, conf_threshold=0.5):
+        # Skip frames intelligently based on detection state
+        if self.frame_skip_count > 0:
+            self.frame_skip_count -= 1
+            return []  # Return empty if skipping
+            
+        boxes = self.detect(frame, conf_threshold)
+        
+        # Adjust frame skipping based on detection results
+        if len(boxes) == 0:
+            self.frame_skip_count = self.max_frame_skip
+        else:
+            self.frame_skip_count = 0  # Process every frame when humans detected
+            
+        return boxes
 
 def main():
     # Connect to the Tello EDU drone
@@ -139,3 +167,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
